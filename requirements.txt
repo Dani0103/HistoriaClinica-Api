@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+spacy
+sqlalchemy
+pymysql
+python-dotenv
+requests
+pytesseract
+python-multipart
+httpx
