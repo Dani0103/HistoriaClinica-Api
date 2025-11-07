@@ -1,26 +1,22 @@
 import os
-import re
-import json
 import datetime
-import tempfile
-import httpx
 from fastapi import FastAPI, HTTPException, Request, Header, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from App.extractor import extract_fields, extract_with_model, load_model
-from App.db import SessionLocal, init_db, save_feedback, save_paciente
-from App.models import TrainingExample, Paciente
+from App.db import SessionLocal, init_db, save_feedback, save_paciente, save_metric
+from App.models import PacienteIn, Metric
 from dotenv import load_dotenv
 from PIL import Image
-import pytesseract
 import requests
 import base64
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
-import random
 import time
 import uuid
+from App.utils_metrics import compute_metrics
+from App.schemas import PacienteCreate
 
 # Cargar variables de entorno
 load_dotenv()
@@ -75,18 +71,6 @@ class FeedbackIn(BaseModel):
     text: str
     labels: dict   # {"nombre":"...", "edad":"...", ...}
 
-class PacienteIn(BaseModel):
-    id: str
-    cedula: str = None
-    nombre: str
-    edad: int = None
-    diagnostico: str = None
-    fechaConsulta: datetime.datetime = None
-    direccion: str = None
-    telefono: str = None
-    observaciones: str = None
-    fechaAnalisis: datetime.datetime = None
-    eps: str = None
 
 # ---------------------------
 # EVENTOS
@@ -112,20 +96,65 @@ def generar_id_unico():
 @app.post("/procesar")
 def procesar(payload: TextIn):
     text = payload.text
+    longitud = len(text)
+    result = {}
 
-    # Intentar con modelo spaCy
-    if nlp:
-        parsed = extract_with_model(nlp, text)
-    else:
-        parsed = {}
+    # Generar id único para esta historia
+    historia_id = generar_id_unico()
 
-    # Fallback por regex/reglas simples
-    fallback = extract_fields(text)
+    # ============================
+    # 🔹 1️⃣ - Proceso con spaCy
+    # ============================
+    inicio_spacy = time.perf_counter()
+    parsed_spacy = extract_with_model(nlp, text) if nlp else {}
+    fin_spacy = time.perf_counter()
+    duracion_spacy = fin_spacy - inicio_spacy
 
-    # Merge de resultados
-    result = {**fallback, **{k: v for k, v in (parsed or {}).items() if v}}
-    result["id"] = generar_id_unico()
+    # ============================
+    # 🔹 2️⃣ - Proceso con regex
+    # ============================
+    inicio_regex = time.perf_counter()
+    parsed_regex = extract_fields(text)
+    fin_regex = time.perf_counter()
+    duracion_regex = fin_regex - inicio_regex
 
+    # ============================
+    # 🔹 3️⃣ - Fusión final (prioriza spaCy si tiene valor)
+    # ============================
+    result = {**parsed_regex, **{k: v for k, v in parsed_spacy.items() if v}}
+    result["id"] = historia_id
+
+    # ============================
+    # 🔹 4️⃣ - Métricas separadas
+    # ============================
+    try:
+        acc_spacy, rec_spacy, f1_spacy = compute_metrics(parsed_spacy)
+        acc_regex, rec_regex, f1_regex = compute_metrics(parsed_regex)
+
+        # 🔹 Determinar el modelo con mejor desempeño (usamos F1)
+        if f1_spacy > f1_regex:
+            mejor_modelo = "spacy"
+            mejor_accuracy, mejor_recall, mejor_f1, mejor_tiempo = acc_spacy, rec_spacy, f1_spacy, duracion_spacy
+        elif f1_regex > f1_spacy:
+            mejor_modelo = "regex"
+            mejor_accuracy, mejor_recall, mejor_f1, mejor_tiempo = acc_regex, rec_regex, f1_regex, duracion_regex
+        else:
+            mejor_modelo = "empate"
+            # Si empatan, guardamos el promedio
+            mejor_accuracy = (acc_spacy + acc_regex) / 2
+            mejor_recall = (rec_spacy + rec_regex) / 2
+            mejor_f1 = (f1_spacy + f1_regex) / 2
+            mejor_tiempo = (duracion_spacy + duracion_regex) / 2
+
+        # Guardar solo el más acertado
+        save_metric(mejor_modelo, mejor_tiempo, mejor_accuracy, mejor_recall, mejor_f1, longitud, historia_id)
+
+    except Exception as e:
+        print(f"⚠️ Error guardando métricas: {e}")
+
+    # =============================
+    # 🔹 Retornar la misma respuesta
+    # =============================
     return result
 
 @app.post("/feedback")
@@ -194,9 +223,9 @@ def ocr_pdf(payload: PDFRequest):
         raise HTTPException(status_code=500, detail=f"Error interno: {e}")
 
 @app.get("/historiales")
-def obtener_historiales(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
+def obtener_historiales(skip: int = 0, limit: int = 2000, db: Session = Depends(get_db)):
     try:
-        registros = db.query(Paciente).offset(skip).limit(limit).all()
+        registros = db.query(PacienteIn).offset(skip).limit(limit).all()
         result = [
             {
                 "id": r.id,
@@ -216,7 +245,7 @@ def obtener_historiales(skip: int = 0, limit: int = 50, db: Session = Depends(ge
         raise HTTPException(status_code=500, detail=f"Error al consultar la base de datos: {e}")
 
 @app.post("/pacientes")
-def crear_paciente(payload: PacienteIn, db: Session = Depends(get_db)):
+def crear_paciente(payload: PacienteCreate, db: Session = Depends(get_db)):
     try:
         # Validar si enviaron ID
         if not payload.id:
@@ -250,3 +279,21 @@ def crear_paciente(payload: PacienteIn, db: Session = Depends(get_db)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al guardar paciente: {e}")
+    
+@app.get("/metrics")
+def obtener_metrics(db: Session = Depends(get_db)):
+    metrics = db.query(Metric).order_by(Metric.fecha.desc()).limit(2000).all()
+    return [
+        {
+            "id": m.id,
+            "historia_id": m.historia_id,
+            "mejor_modelo": m.mejor_modelo,
+            "tiempo": round(m.tiempo, 4),
+            "accuracy": round(m.accuracy, 4),
+            "recall": round(m.recall, 4),
+            "f1": round(m.f1, 4),
+            "longitud_texto": m.longitud_texto,
+            "fecha": m.fecha.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for m in metrics
+    ]

@@ -4,7 +4,7 @@ import json
 import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from App.models import Base, TrainingExample, Paciente
+from App.models import Base, TrainingExample, PacienteIn, Metric
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,7 +39,7 @@ def save_paciente(
     fechaAnalisis: datetime.datetime = None
 ):
     db = SessionLocal()
-    paciente = Paciente(
+    paciente = PacienteIn(
         id=id,
         nombre=nombre,
         edad=edad,
@@ -53,3 +53,25 @@ def save_paciente(
     db.add(paciente)
     db.commit()
     db.close()
+
+def save_metric(mejor_modelo, tiempo, accuracy, recall, f1, longitud, historia_id=None):
+    from App.models import Metric
+    db = SessionLocal()
+    try:
+        m = Metric(
+            historia_id=historia_id,
+            mejor_modelo=mejor_modelo,
+            tiempo=tiempo,
+            accuracy=accuracy,
+            recall=recall,
+            f1=f1,
+            longitud_texto=longitud,
+        )
+        db.add(m)
+        db.commit()
+    except Exception as e:
+        print(f"❌ Error guardando métricas: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
